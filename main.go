@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"time"
 
@@ -43,11 +44,13 @@ var validSizes = []string{
 
 func main() {
 	var (
-		outputDir string
-		size      string
-		setWP     bool
-		wpMethod  string
-		verbose   bool
+		outputDir      string
+		size           string
+		setWP          bool
+		wpMethod       string
+		verbose        bool
+		timelapse      bool
+		framesPerImage int
 	)
 
 	flag.StringVar(&outputDir, "output", defaultOutputDir(), "Directory to save the downloaded image")
@@ -55,6 +58,8 @@ func main() {
 	flag.BoolVar(&setWP, "set-wallpaper", true, "Set the downloaded image as desktop wallpaper")
 	flag.StringVar(&wpMethod, "method", "auto", "Wallpaper method: auto, gnome, kde, xfce, sway, feh, nitrogen")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose output")
+	flag.BoolVar(&timelapse, "timelapse", false, "Generate a timelapse MP4 from the last 24 hours of frames")
+	flag.IntVar(&framesPerImage, "frames-per-image", 3, "Number of video frames per satellite image (controls speed)")
 	flag.Parse()
 
 	if !isValidSize(size) {
@@ -66,6 +71,15 @@ func main() {
 	if err := os.MkdirAll(outputDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create output directory: %v\n", err)
 		os.Exit(1)
+	}
+
+	// Timelapse mode: generate video from saved frames and exit
+	if timelapse {
+		if err := generateTimelapse(outputDir, framesPerImage, verbose); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to generate timelapse: %v\n", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	// Build the image URL
@@ -94,6 +108,12 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Save a timestamped frame for timelapse and purge old frames
+	if err := saveFrame(outputDir, wallpaperPath, verbose); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to save frame: %v\n", err)
+		// Non-fatal: continue to set wallpaper
+	}
+
 	// Set as wallpaper
 	if setWP {
 		if err := setWallpaper(wallpaperPath, wpMethod, verbose); err != nil {
@@ -111,7 +131,7 @@ func defaultOutputDir() string {
 	if err != nil {
 		return "/tmp"
 	}
-	return filepath.Join(home, ".local", "share", "goes-wallpaper")
+	return filepath.Join(home, ".local", "share", "goeswall")
 }
 
 func isValidSize(size string) bool {
@@ -343,6 +363,165 @@ func runCmd(name string, args ...string) error {
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("command %q failed: %w", name, err)
 	}
+	return nil
+}
+
+const (
+	framesDir       = "frames"
+	frameTimeFormat = "20060102-150405"
+	frameRetention  = 24 * time.Hour
+)
+
+// saveFrame copies the wallpaper PNG into the frames directory with a timestamp name,
+// then purges frames older than 24 hours.
+func saveFrame(outputDir, wallpaperPath string, verbose bool) error {
+	framesPath := filepath.Join(outputDir, framesDir)
+	if err := os.MkdirAll(framesPath, 0755); err != nil {
+		return fmt.Errorf("failed to create frames directory: %w", err)
+	}
+
+	frameName := time.Now().Format(frameTimeFormat) + ".png"
+	destPath := filepath.Join(framesPath, frameName)
+
+	// Copy the wallpaper to the frames directory
+	src, err := os.Open(wallpaperPath)
+	if err != nil {
+		return fmt.Errorf("failed to open wallpaper for frame copy: %w", err)
+	}
+	defer src.Close()
+
+	dst, err := os.Create(destPath)
+	if err != nil {
+		return fmt.Errorf("failed to create frame file: %w", err)
+	}
+
+	if _, err := io.Copy(dst, src); err != nil {
+		dst.Close()
+		os.Remove(destPath)
+		return fmt.Errorf("failed to copy frame: %w", err)
+	}
+	if err := dst.Close(); err != nil {
+		os.Remove(destPath)
+		return fmt.Errorf("failed to close frame file: %w", err)
+	}
+
+	if verbose {
+		fmt.Printf("Saved frame: %s\n", destPath)
+	}
+
+	// Purge old frames
+	return purgeOldFrames(framesPath, verbose)
+}
+
+// purgeOldFrames removes frame files older than frameRetention.
+func purgeOldFrames(framesPath string, verbose bool) error {
+	entries, err := os.ReadDir(framesPath)
+	if err != nil {
+		return fmt.Errorf("failed to read frames directory: %w", err)
+	}
+
+	cutoff := time.Now().Add(-frameRetention)
+
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".png") {
+			continue
+		}
+
+		// Parse timestamp from filename
+		name := strings.TrimSuffix(entry.Name(), ".png")
+		t, err := time.Parse(frameTimeFormat, name)
+		if err != nil {
+			continue // skip files that don't match our naming
+		}
+
+		if t.Before(cutoff) {
+			path := filepath.Join(framesPath, entry.Name())
+			if err := os.Remove(path); err == nil && verbose {
+				fmt.Printf("Purged old frame: %s\n", entry.Name())
+			}
+		}
+	}
+
+	return nil
+}
+
+// generateTimelapse creates an MP4 video from the saved frames using ffmpeg.
+func generateTimelapse(outputDir string, framesPerImage int, verbose bool) error {
+	framesPath := filepath.Join(outputDir, framesDir)
+
+	entries, err := os.ReadDir(framesPath)
+	if err != nil {
+		return fmt.Errorf("failed to read frames directory: %w", err)
+	}
+
+	// Collect and sort frame files
+	var frames []string
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".png") {
+			continue
+		}
+		frames = append(frames, entry.Name())
+	}
+
+	if len(frames) == 0 {
+		return fmt.Errorf("no frames found in %s", framesPath)
+	}
+
+	// Frames are named with timestamps, so lexicographic sort = chronological
+	sort.Strings(frames)
+
+	if verbose {
+		fmt.Printf("Found %d frames for timelapse\n", len(frames))
+	}
+
+	// Create ffmpeg concat demuxer file
+	concatPath := filepath.Join(outputDir, "concat.txt")
+	duration := fmt.Sprintf("%.4f", float64(framesPerImage)/30.0)
+
+	var concatContent strings.Builder
+	for _, frame := range frames {
+		absFrame := filepath.Join(framesPath, frame)
+		concatContent.WriteString(fmt.Sprintf("file '%s'\nduration %s\n", absFrame, duration))
+	}
+	// ffmpeg concat needs the last file repeated without duration
+	lastFrame := filepath.Join(framesPath, frames[len(frames)-1])
+	concatContent.WriteString(fmt.Sprintf("file '%s'\n", lastFrame))
+
+	if err := os.WriteFile(concatPath, []byte(concatContent.String()), 0644); err != nil {
+		return fmt.Errorf("failed to write concat file: %w", err)
+	}
+	defer os.Remove(concatPath)
+
+	// Run ffmpeg
+	outputPath := filepath.Join(outputDir, "timelapse.mp4")
+	args := []string{
+		"-y",
+		"-f", "concat",
+		"-safe", "0",
+		"-i", concatPath,
+		"-c:v", "libx264",
+		"-pix_fmt", "yuv420p",
+		"-r", "30",
+		outputPath,
+	}
+
+	if verbose {
+		fmt.Printf("Running: ffmpeg %s\n", strings.Join(args, " "))
+	}
+
+	cmd := exec.Command("ffmpeg", args...)
+	if verbose {
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+	}
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("ffmpeg failed: %w", err)
+	}
+
+	if verbose {
+		fmt.Printf("Timelapse saved to: %s\n", outputPath)
+	}
+
 	return nil
 }
 
