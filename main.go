@@ -499,6 +499,7 @@ func generateTimelapse(outputDir string, framesPerImage int, verbose bool) error
 		"-f", "concat",
 		"-safe", "0",
 		"-i", concatPath,
+		"-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
 		"-c:v", "libx264",
 		"-pix_fmt", "yuv420p",
 		"-r", "30",
