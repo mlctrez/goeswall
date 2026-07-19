@@ -1,7 +1,7 @@
 BINARY := goeswall
 INSTALL_DIR := $(HOME)/.local/bin
 
-.PHONY: build install clean
+.PHONY: build install clean run
 
 build:
 	go build -o $(BINARY) .
@@ -12,3 +12,6 @@ install: build
 
 clean:
 	rm -f $(BINARY)
+
+run:
+	go run . -method gnome

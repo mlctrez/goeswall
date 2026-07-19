@@ -3,6 +3,11 @@ package main
 import (
 	"flag"
 	"fmt"
+	"image"
+	"image/color"
+	"image/draw"
+	"image/jpeg"
+	"image/png"
 	"io"
 	"net/http"
 	"os"
@@ -11,11 +16,19 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"golang.org/x/image/font"
+	"golang.org/x/image/font/basicfont"
+	"golang.org/x/image/math/fixed"
 )
 
 const (
 	// GOES-East (GOES-19) CONUS GeoColor imagery from NOAA CDN
 	baseURL = "https://cdn.star.nesdis.noaa.gov/GOES19/ABI/CONUS/GEOCOLOR/"
+
+	// Timestamp position offset from the top-left corner in pixels
+	timestampOffsetX = 100
+	timestampOffsetY = 40
 )
 
 // Available image sizes from the NOAA CDN
@@ -121,16 +134,54 @@ func buildImageURL(size string) string {
 // This removes the Atlantic Ocean and Mexico from the GOES CONUS imagery and avoids
 // GNOME's gdk-pixbuf JPEG rendering issues with large files.
 func cropAndConvert(srcPath, destPath string, verbose bool) error {
-	// Crop upper-left 2/3 in both dimensions: "66.67%x66.67%+0+0"
-	cropGeometry := "66.67%x66.67%+0+0"
 	if verbose {
 		fmt.Printf("Cropping upper-left 2/3 and converting to PNG: %s\n", destPath)
 	}
 
-	tmpPath := destPath + ".tmp.png"
-	err := runCmd("convert", srcPath, "-crop", cropGeometry, "+repage", "png:"+tmpPath)
+	srcFile, err := os.Open(srcPath)
 	if err != nil {
-		return fmt.Errorf("ImageMagick convert failed: %w", err)
+		return fmt.Errorf("failed to open source image: %w", err)
+	}
+	defer srcFile.Close()
+
+	img, err := jpeg.Decode(srcFile)
+	if err != nil {
+		return fmt.Errorf("failed to decode JPEG: %w", err)
+	}
+
+	bounds := img.Bounds()
+	cropWidth := bounds.Dx() * 2 / 3
+	cropHeight := bounds.Dy() * 2 / 3
+	cropRect := image.Rect(bounds.Min.X, bounds.Min.Y, bounds.Min.X+cropWidth, bounds.Min.Y+cropHeight)
+
+	type subImager interface {
+		SubImage(r image.Rectangle) image.Image
+	}
+	cropped := img.(subImager).SubImage(cropRect)
+
+	// Draw the cropped image into a mutable RGBA so we can overlay the timestamp
+	dst := image.NewRGBA(cropped.Bounds())
+	draw.Draw(dst, dst.Bounds(), cropped, cropped.Bounds().Min, draw.Src)
+
+	// Render current time and repo URL
+	timestamp := time.Now().Format("15:04:05")
+	repoURL := "goeswall"
+	drawTimestamp(dst, timestamp, repoURL)
+
+	tmpPath := destPath + ".tmp.png"
+	outFile, err := os.Create(tmpPath)
+	if err != nil {
+		return fmt.Errorf("failed to create output file: %w", err)
+	}
+
+	if err := png.Encode(outFile, dst); err != nil {
+		outFile.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to encode PNG: %w", err)
+	}
+	if err := outFile.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("failed to close output file: %w", err)
 	}
 
 	if err := os.Rename(tmpPath, destPath); err != nil {
@@ -293,4 +344,51 @@ func runCmd(name string, args ...string) error {
 		return fmt.Errorf("command %q failed: %w", name, err)
 	}
 	return nil
+}
+
+// drawTimestamp renders lines of text in light grey at the top-left of the image, scaled 2x.
+func drawTimestamp(img *image.RGBA, lines ...string) {
+	face := basicfont.Face7x13
+	col := color.RGBA{R: 200, G: 200, B: 200, A: 255}
+
+	glyphWidth := 7
+	glyphHeight := 13
+	descent := 2 // basicfont.Face7x13 descent
+	imgHeight := glyphHeight + descent
+	scale := 2
+	lineSpacing := 4 // pixels between lines at 1x
+
+	bounds := img.Bounds()
+	oy := bounds.Min.Y + timestampOffsetY
+
+	for _, text := range lines {
+		textWidth := len(text) * glyphWidth
+
+		// Create a temporary image for the text at 1x (include descent for g, p, y, etc.)
+		tmp := image.NewRGBA(image.Rect(0, 0, textWidth, imgHeight))
+		d := &font.Drawer{
+			Dst:  tmp,
+			Src:  image.NewUniform(col),
+			Face: face,
+			Dot:  fixed.P(0, glyphHeight-descent),
+		}
+		d.DrawString(text)
+
+		// Draw scaled 2x into the destination image
+		ox := bounds.Min.X + timestampOffsetX
+		for sy := 0; sy < imgHeight; sy++ {
+			for sx := 0; sx < textWidth; sx++ {
+				c := tmp.RGBAAt(sx, sy)
+				if c.A > 0 {
+					for dy := 0; dy < scale; dy++ {
+						for dx := 0; dx < scale; dx++ {
+							img.SetRGBA(ox+sx*scale+dx, oy+sy*scale+dy, c)
+						}
+					}
+				}
+			}
+		}
+
+		oy += (imgHeight + lineSpacing) * scale
+	}
 }
