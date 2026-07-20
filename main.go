@@ -429,7 +429,7 @@ func purgeOldFrames(framesPath string, verbose bool) error {
 
 		// Parse timestamp from filename
 		name := strings.TrimSuffix(entry.Name(), ".png")
-		t, err := time.Parse(frameTimeFormat, name)
+		t, err := time.ParseInLocation(frameTimeFormat, name, time.Local)
 		if err != nil {
 			continue // skip files that don't match our naming
 		}
