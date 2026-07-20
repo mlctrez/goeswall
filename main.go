@@ -59,7 +59,7 @@ func main() {
 	flag.StringVar(&wpMethod, "method", "auto", "Wallpaper method: auto, gnome, kde, xfce, sway, feh, nitrogen")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose output")
 	flag.BoolVar(&timelapse, "timelapse", false, "Generate a timelapse MP4 from the last 24 hours of frames")
-	flag.IntVar(&framesPerImage, "frames-per-image", 3, "Number of video frames per satellite image (controls speed)")
+	flag.IntVar(&framesPerImage, "frames-per-image", 9, "Number of video frames per satellite image (controls speed)")
 	flag.Parse()
 
 	if !isValidSize(size) {
@@ -493,7 +493,7 @@ func generateTimelapse(outputDir string, framesPerImage int, verbose bool) error
 	defer os.Remove(concatPath)
 
 	// Run ffmpeg
-	outputPath := filepath.Join(outputDir, "timelapse.mp4")
+	outputPath := filepath.Join(outputDir, "timelapse-"+time.Now().Format("20060102")+".mp4")
 	args := []string{
 		"-y",
 		"-f", "concat",
