@@ -58,7 +58,7 @@ func main() {
 	flag.BoolVar(&setWP, "set-wallpaper", true, "Set the downloaded image as desktop wallpaper")
 	flag.StringVar(&wpMethod, "method", "auto", "Wallpaper method: auto, gnome, kde, xfce, sway, feh, nitrogen")
 	flag.BoolVar(&verbose, "verbose", false, "Enable verbose output")
-	flag.BoolVar(&timelapse, "timelapse", false, "Generate a timelapse MP4 from the last 24 hours of frames")
+	flag.BoolVar(&timelapse, "timelapse", false, "Generate a timelapse MP4 from the last 24 hours of frames, keeping videos from the previous 10 days")
 	flag.IntVar(&framesPerImage, "frames-per-image", 9, "Number of video frames per satellite image (controls speed)")
 	flag.Parse()
 
@@ -367,9 +367,12 @@ func runCmd(name string, args ...string) error {
 }
 
 const (
-	framesDir       = "frames"
-	frameTimeFormat = "20060102-150405"
-	frameRetention  = 24 * time.Hour
+	framesDir              = "frames"
+	frameTimeFormat        = "20060102-150405"
+	frameRetention         = 24 * time.Hour
+	timelapsePrefix        = "timelapse-"
+	timelapseDateFormat    = "20060102"
+	timelapseRetentionDays = 10
 )
 
 // saveFrame copies the wallpaper PNG into the frames directory with a timestamp name,
@@ -493,7 +496,7 @@ func generateTimelapse(outputDir string, framesPerImage int, verbose bool) error
 	defer os.Remove(concatPath)
 
 	// Run ffmpeg
-	outputPath := filepath.Join(outputDir, "timelapse-"+time.Now().Format("20060102")+".mp4")
+	outputPath := filepath.Join(outputDir, timelapsePrefix+time.Now().Format(timelapseDateFormat)+".mp4")
 	args := []string{
 		"-y",
 		"-f", "concat",
@@ -521,6 +524,49 @@ func generateTimelapse(outputDir string, framesPerImage int, verbose bool) error
 
 	if verbose {
 		fmt.Printf("Timelapse saved to: %s\n", outputPath)
+	}
+
+	if err := purgeOldTimelapses(outputDir, time.Now(), verbose); err != nil {
+		return fmt.Errorf("timelapse saved to %s, but failed to purge old videos: %w", outputPath, err)
+	}
+
+	return nil
+}
+
+// purgeOldTimelapses removes timelapse-YYYYMMDD.mp4 files older than
+// timelapseRetentionDays calendar days. Today's video and the previous
+// 9 days are kept.
+func purgeOldTimelapses(outputDir string, now time.Time, verbose bool) error {
+	entries, err := os.ReadDir(outputDir)
+	if err != nil {
+		return fmt.Errorf("failed to read output directory: %w", err)
+	}
+
+	today := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, now.Location())
+	cutoff := today.AddDate(0, 0, -(timelapseRetentionDays - 1))
+
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		name := entry.Name()
+		if !strings.HasPrefix(name, timelapsePrefix) || !strings.HasSuffix(name, ".mp4") {
+			continue
+		}
+		dateStr := strings.TrimSuffix(strings.TrimPrefix(name, timelapsePrefix), ".mp4")
+		t, err := time.ParseInLocation(timelapseDateFormat, dateStr, now.Location())
+		if err != nil {
+			continue
+		}
+		if t.Before(cutoff) {
+			path := filepath.Join(outputDir, name)
+			if err := os.Remove(path); err != nil {
+				return fmt.Errorf("failed to remove %s: %w", name, err)
+			}
+			if verbose {
+				fmt.Printf("Purged old timelapse: %s\n", name)
+			}
+		}
 	}
 
 	return nil
